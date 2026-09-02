@@ -2561,34 +2561,49 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         // reverts StatRequiresStatBoost for them), so the stored delta after any telescoped op is
         // exactly newBoosted - base — writing that directly is bit-identical to the dispatcher's
         // sentinel-aware add, minus its 2 TLOADs + 2 mapping keccaks + enum chain per stat.
-        bool hasListener = _monListensAt(config, targetIndex, monIndex, EffectStep.OnUpdateMonState);
+        if (_monListensAt(config, targetIndex, monIndex, EffectStep.OnUpdateMonState)) {
+            for (uint256 i; i < 5; ++i) {
+                // old boosted = base + current stat-boost delta (sentinel reads as 0 / "no boost")
+                int32 valueToAdd = int32(newBoostedStats[i]) - int32(baseStats[i]) - _statBoostCurrentDelta(st, i);
+                if (valueToAdd != 0) {
+                    _updateMonStateInternal(
+                        targetIndex, monIndex, StatBoostLib.statBoostIndexToMonStateIndex(i), valueToAdd
+                    );
+                }
+            }
+            return;
+        }
 
+        // Direct path: one read-modify-write of the packed MonState word for all five lanes.
+        // Lane offsets follow the MonState layout (hp 0, stamina 32, speed 64, attack 96,
+        // defence 128, spAtk 160, spDef 192); boost index 4 is speed, 0-3 map to attack..spDef.
+        uint256 word;
+        assembly ("memory-safe") {
+            word := sload(st.slot)
+        }
+        uint256 original = word;
+        bool speedChanged;
         for (uint256 i; i < 5; ++i) {
-            // old boosted = base + current stat-boost delta (sentinel reads as 0 / "no boost")
-            int32 valueToAdd = int32(newBoostedStats[i]) - int32(baseStats[i]) - _statBoostCurrentDelta(st, i);
-            if (valueToAdd == 0) {
+            uint256 shift = i == 4 ? 64 : 96 + (i << 5);
+            int32 current = int32(uint32(word >> shift));
+            if (current == CLEARED_MON_STATE_SENTINEL) {
+                current = 0;
+            }
+            int32 newDelta = int32(newBoostedStats[i]) - int32(baseStats[i]);
+            if (newDelta == current) {
                 continue;
             }
-            if (hasListener) {
-                _updateMonStateInternal(
-                    targetIndex, monIndex, StatBoostLib.statBoostIndexToMonStateIndex(i), valueToAdd
-                );
-            } else {
-                int32 newDelta = int32(newBoostedStats[i]) - int32(baseStats[i]);
-                if (i == 0) {
-                    st.attackDelta = newDelta;
-                } else if (i == 1) {
-                    st.defenceDelta = newDelta;
-                } else if (i == 2) {
-                    st.specialAttackDelta = newDelta;
-                } else if (i == 3) {
-                    st.specialDefenceDelta = newDelta;
-                } else {
-                    st.speedDelta = newDelta;
-                    if (config.battleMode != BATTLE_MODE_SINGLES) {
-                        _markActiveMonSpeedDirty(targetIndex, monIndex);
-                    }
-                }
+            word = (word & ~(uint256(0xFFFFFFFF) << shift)) | (uint256(uint32(newDelta)) << shift);
+            if (i == 4) {
+                speedChanged = true;
+            }
+        }
+        if (word != original) {
+            assembly ("memory-safe") {
+                sstore(st.slot, word)
+            }
+            if (speedChanged && config.battleMode != BATTLE_MODE_SINGLES) {
+                _markActiveMonSpeedDirty(targetIndex, monIndex);
             }
         }
     }
