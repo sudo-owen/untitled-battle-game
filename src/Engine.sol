@@ -64,6 +64,9 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     // Two-slot action scheduler invalidation. Speed-mutating API chokepoints mark active lanes;
     // the next greedy pick refreshes only those lanes from mon storage.
     uint256 private transient _speedDirtySlots;
+    // 2-slot effect-pass scan cache invalidation: set by every KO set/clear, active-lane write
+    // and speed change; the pass rescans candidates/speeds only when it is nonzero.
+    uint256 private transient _effectScanDirty;
 
     // Errors
     error NoWriteAllowed();
@@ -1584,6 +1587,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         tempPreDamage = 0;
         effectsDirtyBitmap = 0;
         _speedDirtySlots = 0;
+        _effectScanDirty = 0;
     }
 
     /// @notice Forcibly end a stalled battle once it has run past MAX_BATTLE_DURATION.
@@ -4276,6 +4280,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     }
 
     function _setSlotActive(BattleData storage battle, uint256 absSlot, uint256 monIndex) private {
+        _effectScanDirty = 1;
         uint256 side = absSlot >> 1;
         if (absSlot & 1 == 0) {
             battle.activeMonIndex = _setActiveMonIndex(battle.activeMonIndex, side, monIndex);
@@ -4300,6 +4305,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         }
         if (dirty != 0) {
             _speedDirtySlots |= dirty;
+            _effectScanDirty = 1;
         }
     }
 
@@ -4652,41 +4658,32 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         }
     }
 
-    /// @dev Effect-pass picker with the same rank-dependent jitter as `_pickNextSlot`, but it
-    ///      reads each remaining slot's live speed only once while advancing over consecutive
-    ///      non-listeners. The caller invokes it again after every listener runs, preserving D29:
-    ///      effects may change speed, KO a mon, or replace an active before the next hook.
-    function _pickNextEffectSlot(
+    /// @dev Effect-pass candidate scan: live (non-empty, non-KO'd) slots, their current speeds
+    ///      and which of them listen at `step`. Cached across picks by _runSlotEffectPass and
+    ///      rebuilt only after a KO, lane write or speed change (`_effectScanDirty`), which
+    ///      preserves D29: the next pick still sees every mutation an effect made.
+    function _scanEffectSlots(
         BattleConfig storage config,
         BattleData storage battle,
         uint256 stepsWord,
-        uint256 doneMask,
-        uint256 rng,
-        uint256 pickBase,
-        uint256 pick,
         EffectStep step
-    ) private view returns (uint256 slot, uint256 newDoneMask, uint256 nextPick) {
-        uint256 candidateMask;
-        uint256 listenerMask;
-        uint256 speeds;
+    ) private view returns (uint256 candidateMask, uint256 listenerMask, uint256 speeds) {
         uint256 actives = _buildActivesWord(battle);
         for (uint256 s; s < 4;) {
-            if (doneMask & (1 << s) == 0) {
-                uint256 side = s >> 1;
-                uint256 mon = TargetLib.activeAt(actives, s);
-                if (mon != EMPTY_ACTIVE_LANE) {
-                    MonState storage st = _getMonState(config, side, mon);
-                    if (!st.isKnockedOut) {
-                        candidateMask |= 1 << s;
-                        int32 spdDelta = st.speedDelta;
-                        int256 spd = int256(uint256(_getTeamMon(config, side, mon).stats.speed))
-                            + (spdDelta == CLEARED_MON_STATE_SENTINEL ? int256(0) : int256(spdDelta));
-                        if (spd > 0) {
-                            speeds |= uint256(spd) << (s << 6);
-                        }
-                        if (_stepsWordListens(stepsWord, side, mon, step)) {
-                            listenerMask |= 1 << s;
-                        }
+            uint256 side = s >> 1;
+            uint256 mon = TargetLib.activeAt(actives, s);
+            if (mon != EMPTY_ACTIVE_LANE) {
+                MonState storage st = _getMonState(config, side, mon);
+                if (!st.isKnockedOut) {
+                    candidateMask |= 1 << s;
+                    int32 spdDelta = st.speedDelta;
+                    int256 spd = int256(uint256(_getTeamMon(config, side, mon).stats.speed))
+                        + (spdDelta == CLEARED_MON_STATE_SENTINEL ? int256(0) : int256(spdDelta));
+                    if (spd > 0) {
+                        speeds |= uint256(spd) << (s << 6);
+                    }
+                    if (_stepsWordListens(stepsWord, side, mon, step)) {
+                        listenerMask |= 1 << s;
                     }
                 }
             }
@@ -4694,39 +4691,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                 ++s;
             }
         }
-
-        newDoneMask = doneMask;
-        nextPick = pick;
-        while (nextPick < 4 && candidateMask != 0) {
-            uint256 best = NO_SLOT;
-            uint256 bestSpeed;
-            uint256 bestJitter;
-            uint256 h = uint256(keccak256(abi.encode(rng, pickBase + nextPick)));
-            for (uint256 s; s < 4;) {
-                if (candidateMask & (1 << s) != 0) {
-                    uint256 speed = uint64(speeds >> (s << 6));
-                    uint256 jitter = uint64(h >> (s << 6));
-                    if (best == NO_SLOT || speed > bestSpeed || (speed == bestSpeed && jitter > bestJitter)) {
-                        best = s;
-                        bestSpeed = speed;
-                        bestJitter = jitter;
-                    }
-                }
-                unchecked {
-                    ++s;
-                }
-            }
-            uint256 bit = 1 << best;
-            candidateMask &= ~bit;
-            newDoneMask |= bit;
-            unchecked {
-                ++nextPick;
-            }
-            if (listenerMask & bit != 0) {
-                return (best, newDoneMask, nextPick);
-            }
-        }
-        return (NO_SLOT, newDoneMask, nextPick);
     }
 
     /// @dev Resolve one slot's action: coercion (turn-0 / KO'd -> switch), switch legality
@@ -5030,9 +4994,50 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         // RoundStart and RoundEnd orderings roll independently.
         uint256 pickBase = step == EffectStep.RoundStart ? 16 : 24;
         uint256 pick;
+        uint256 candidateMask;
+        uint256 listenerMask;
+        uint256 speeds;
+        bool scanned;
         while (pick < 4) {
-            uint256 slot;
-            (slot, doneMask, pick) = _pickNextEffectSlot(config, battle, stepsWord, doneMask, rng, pickBase, pick, step);
+            if (!scanned || _effectScanDirty != 0) {
+                (candidateMask, listenerMask, speeds) = _scanEffectSlots(config, battle, stepsWord, step);
+                scanned = true;
+                _effectScanDirty = 0;
+            }
+            // Same rank-dependent jitter as _pickNextSlot: highest (speed, jitter) among the
+            // remaining live slots; non-listeners are consumed without running anything.
+            uint256 slot = NO_SLOT;
+            uint256 remaining = candidateMask & ~doneMask;
+            while (pick < 4 && remaining != 0) {
+                uint256 best = NO_SLOT;
+                uint256 bestSpeed;
+                uint256 bestJitter;
+                uint256 h = uint256(keccak256(abi.encode(rng, pickBase + pick)));
+                for (uint256 s; s < 4;) {
+                    if (remaining & (1 << s) != 0) {
+                        uint256 speed = uint64(speeds >> (s << 6));
+                        uint256 jitter = uint64(h >> (s << 6));
+                        if (best == NO_SLOT || speed > bestSpeed || (speed == bestSpeed && jitter > bestJitter)) {
+                            best = s;
+                            bestSpeed = speed;
+                            bestJitter = jitter;
+                        }
+                    }
+                    unchecked {
+                        ++s;
+                    }
+                }
+                uint256 bit = 1 << best;
+                remaining &= ~bit;
+                doneMask |= bit;
+                unchecked {
+                    ++pick;
+                }
+                if (listenerMask & bit != 0) {
+                    slot = best;
+                    break;
+                }
+            }
             if (slot == NO_SLOT) {
                 break;
             }
@@ -5267,6 +5272,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     }
 
     function _setMonKO(BattleConfig storage config, uint256 playerIndex, uint256 monIndex) private {
+        _effectScanDirty = 1;
         uint256 bit = 1 << monIndex;
         if (playerIndex == 0) {
             config.koBitmaps = config.koBitmaps | uint16(bit);
@@ -5276,6 +5282,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     }
 
     function _clearMonKO(BattleConfig storage config, uint256 playerIndex, uint256 monIndex) private {
+        _effectScanDirty = 1;
         uint256 bit = 1 << monIndex;
         if (playerIndex == 0) {
             config.koBitmaps = config.koBitmaps & uint16(~bit);
