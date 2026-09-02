@@ -1148,7 +1148,10 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         if (encoded != 0) {
             return encoded & 0xFFFFFF;
         }
-        MoveDecision storage move = playerIndex == 0 ? config.p0Move : config.p1Move;
+        return _storedMoveWord(playerIndex == 0 ? config.p0Move : config.p1Move);
+    }
+
+    function _storedMoveWord(MoveDecision storage move) private view returns (uint256) {
         return uint256(move.packedMoveIndex) | (uint256(move.extraData) << 8);
     }
 
@@ -1238,8 +1241,9 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint256 p1Packed = _turnP1Packed;
         // Pre-populated transient (executeWithMoves / buffer paths) vs plain execute() (storage fallback)
         bool cameFromDirectMoveInput = p0Packed != 0 || p1Packed != 0;
-        MoveDecision memory p0TurnMove = p0Packed != 0 ? _decodeMove(p0Packed >> 104) : config.p0Move;
-        MoveDecision memory p1TurnMove = p1Packed != 0 ? _decodeMove(p1Packed >> 104) : config.p1Move;
+        // Allocation-free 24-bit move words: [packedMoveIndex 8 | extraData 16].
+        uint256 p0TurnMove = p0Packed != 0 ? (p0Packed >> 104) & 0xFFFFFF : _storedMoveWord(config.p0Move);
+        uint256 p1TurnMove = p1Packed != 0 ? (p1Packed >> 104) & 0xFFFFFF : _storedMoveWord(config.p1Move);
         if (emitMonMoves) {
             _emitMonMoves(
                 battleKey,
@@ -3491,12 +3495,13 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint256 playerIndex,
         uint256 prevPlayerSwitchForTurnFlag
     ) internal returns (uint256 playerSwitchForTurnFlag) {
-        MoveDecision memory move = _getCurrentTurnMove(config, playerIndex);
+        uint256 moveWord = _currentTurnMoveWord(config, playerIndex);
+        uint16 extraData = uint16(moveWord >> 8);
         int32 staminaCost;
         playerSwitchForTurnFlag = prevPlayerSwitchForTurnFlag;
 
         // Unpack moveIndex from packedMoveIndex (lower 7 bits, with +1 offset for regular moves)
-        uint8 storedMoveIndex = move.packedMoveIndex & MOVE_INDEX_MASK;
+        uint8 storedMoveIndex = uint8(moveWord) & MOVE_INDEX_MASK;
         uint8 moveIndex = storedMoveIndex >= SWITCH_MOVE_INDEX ? storedMoveIndex : storedMoveIndex - MOVE_INDEX_OFFSET;
 
         // Handle shouldSkipTurn flag first and toggle it off if set
@@ -3521,7 +3526,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         // Target the first non-KO'd slot so the switch always lands
         if ((battle.turnId == 0 || currentMonState.isKnockedOut) && moveIndex != SWITCH_MOVE_INDEX) {
             moveIndex = SWITCH_MOVE_INDEX;
-            move.extraData = uint16(_firstNonKOed(config, playerIndex));
+            extraData = uint16(_firstNonKOed(config, playerIndex));
         }
 
         // Handle a switch, no-op, or regular move.
@@ -3530,7 +3535,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         if (moveIndex == SWITCH_MOVE_INDEX) {
             // Validate switch target before mutating state. Each gate silently no-ops — an invalid
             // switch leaves the player stuck (same state machine as if they missed the timeout window).
-            uint256 monToSwitchIndex = uint256(move.extraData & EXTRA_DATA_PAYLOAD_MASK);
+            uint256 monToSwitchIndex = uint256(extraData & EXTRA_DATA_PAYLOAD_MASK);
             uint256 teamSize = (playerIndex == 0) ? (config.teamSizes & 0x0F) : (config.teamSizes >> 4);
             if (monToSwitchIndex >= teamSize) {
                 return playerSwitchForTurnFlag;
@@ -3621,7 +3626,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                         activeMonIndex,
                         targetBits,
                         moveContext,
-                        move.extraData & EXTRA_DATA_PAYLOAD_MASK,
+                        extraData & EXTRA_DATA_PAYLOAD_MASK,
                         tempRNG
                     );
                 } else {
@@ -3632,7 +3637,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                         activeMonIndex,
                         targetBits,
                         moveContext,
-                        move.extraData & EXTRA_DATA_PAYLOAD_MASK,
+                        extraData & EXTRA_DATA_PAYLOAD_MASK,
                         tempRNG
                     );
                 }
@@ -4051,11 +4056,11 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         BattleData storage battle,
         bytes32 battleKey,
         uint256 rng,
-        MoveDecision memory p0TurnMove,
-        MoveDecision memory p1TurnMove
+        uint256 p0TurnMove,
+        uint256 p1TurnMove
     ) private view returns (uint256) {
-        uint8 p0StoredIndex = p0TurnMove.packedMoveIndex & MOVE_INDEX_MASK;
-        uint8 p1StoredIndex = p1TurnMove.packedMoveIndex & MOVE_INDEX_MASK;
+        uint8 p0StoredIndex = uint8(p0TurnMove) & MOVE_INDEX_MASK;
+        uint8 p1StoredIndex = uint8(p1TurnMove) & MOVE_INDEX_MASK;
         uint8 p0MoveIndex = p0StoredIndex >= SWITCH_MOVE_INDEX ? p0StoredIndex : p0StoredIndex - MOVE_INDEX_OFFSET;
         uint8 p1MoveIndex = p1StoredIndex >= SWITCH_MOVE_INDEX ? p1StoredIndex : p1StoredIndex - MOVE_INDEX_OFFSET;
 
@@ -5185,7 +5190,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             _inlineRegenStaminaForMon(config, 1, p1ActiveMonIndex);
         } else if (round == EffectStep.AfterMove) {
             // Fetch packedMoveIndex via helper - resolves to transient during executeWithMoves, storage otherwise.
-            uint8 packedMoveIndex = _getCurrentTurnMove(config, playerIndex).packedMoveIndex;
+            uint8 packedMoveIndex = uint8(_currentTurnMoveWord(config, playerIndex));
             if (!StaminaRegenLogic._isRestingMove(packedMoveIndex)) {
                 return playerSwitchForTurnFlag;
             }
@@ -5239,22 +5244,23 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     function _emitMonMoves(
         bytes32 battleKey,
         BattleData storage battle,
-        MoveDecision memory p0Move,
-        MoveDecision memory p1Move,
+        uint256 p0Move,
+        uint256 p1Move,
         uint104 p0Salt,
         uint104 p1Salt
     ) private {
         // Skip the emit entirely if neither player submitted this turn.
-        if (p0Move.packedMoveIndex == 0 && p1Move.packedMoveIndex == 0) {
+        if (uint8(p0Move) == 0 && uint8(p1Move) == 0) {
             return;
         }
 
         uint256 p0MonIndex = _unpackActiveMonIndex(battle.activeMonIndex, 0);
         uint256 p1MonIndex = _unpackActiveMonIndex(battle.activeMonIndex, 1);
 
-        uint256 packedMoves = uint256(uint8(p0MonIndex)) | (uint256(p0Move.packedMoveIndex) << 8)
-            | (uint256(p0Move.extraData) << 16) | (uint256(uint8(p1MonIndex)) << 32)
-            | (uint256(p1Move.packedMoveIndex) << 40) | (uint256(p1Move.extraData) << 48);
+        // Move words are [packedMoveIndex 8 | extraData 16], so shifting the whole word lands
+        // both fields in their MonMoves lanes.
+        uint256 packedMoves = uint256(uint8(p0MonIndex)) | (p0Move << 8) | (uint256(uint8(p1MonIndex)) << 32)
+            | (p1Move << 40);
 
         uint256 packedSalts = uint256(p0Salt) | (uint256(p1Salt) << 104);
 
