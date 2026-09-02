@@ -35,20 +35,19 @@ library StatBoostLib {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Aggregation accumulator (one uint256 per mon, cached by the Engine).
+    // Aggregation accumulator (one uint256, rebuilt in memory by the Engine on every change).
     //
-    // 5 stat lanes of [numerator:48 | count:3] at bit k*51, plus bit 255 = DISABLED. A lane
-    // mirrors _accumulateOne's running product exactly: numerator = base × ∏(100 ± pct) with
-    // count total instances, finalized as numerator / 100^count (single divide — so incremental
-    // multiply-in / divide-out is bit-identical to a full recompute). An update that would
-    // overflow a lane's 48-bit numerator or 3-bit count returns ok = false; the Engine then sets
-    // DISABLED and falls back to recompute-from-sources for the rest of the battle.
+    // 5 stat lanes of [numerator:48 | count:3] at bit k*51. A lane mirrors _accumulateOne's
+    // running product exactly: numerator = base × ∏(100 ± pct) with count total instances,
+    // finalized as numerator / 100^count (single divide — so multiply-in / divide-out is
+    // bit-identical to the legacy recompute). An update that would overflow a lane's 48-bit
+    // numerator or 3-bit count returns ok = false; the Engine then falls back to the legacy
+    // unchecked aggregation over the source words.
     // ---------------------------------------------------------------------------------------------
 
     uint256 internal constant ACC_LANE_BITS = 51;
     uint256 internal constant ACC_NUM_MASK = (1 << 48) - 1;
     uint256 internal constant ACC_CNT_MASK = 0x7;
-    uint256 internal constant ACC_DISABLED_BIT = 1 << 255;
 
     /// @dev Lane k of a packed source word: (pct, count, isMul). count == 0 means "no boost".
     function laneAt(bytes32 data, uint256 k) internal pure returns (uint256 pct, uint256 cnt, bool mul) {

@@ -2104,11 +2104,10 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         // OnApply has already run before installation. Do not persist an OnApply-only request as
         // the broad capability flag, which would make multi-hook statuses build unused contexts.
         bool usesResolver = hookContextBitmap & EFFECT_RESOLVER_METADATA_BIT != 0;
-        uint16 storedContextBitmap = hookContextBitmap
-            & ~uint16((1 << uint8(EffectStep.OnApply)) | EFFECT_RESOLVER_METADATA_BIT);
+        uint16 storedContextBitmap =
+            hookContextBitmap & ~uint16((1 << uint8(EffectStep.OnApply)) | EFFECT_RESOLVER_METADATA_BIT);
         uint256 header = uint256(uint160(address(effect))) | (uint256(stepsBitmap) << 160) | (encoded << 176)
-            | (usesResolver ? EFFECT_RESOLVER_FLAG : 0)
-            | (storedContextBitmap != 0 ? EFFECT_HOOK_CONTEXT_FLAG : 0);
+            | (usesResolver ? EFFECT_RESOLVER_FLAG : 0) | (storedContextBitmap != 0 ? EFFECT_HOOK_CONTEXT_FLAG : 0);
         assembly ("memory-safe") {
             sstore(effectInstance.slot, header)
         }
@@ -2313,7 +2312,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     //
     // Formerly the standalone `StatBoosts` effect contract. Boost sources live in their own
     // per-mon store — one packed word per source in p0/p1BoostWords, 4-bit counts in
-    // p0/p1BoostCounts, aggregation cache in statBoostAcc — NOT in the effect mappings, so effect
+    // p0/p1BoostCounts, aggregate recomputed from the words on every change — NOT in the effect mappings, so effect
     // passes never iterate them; Temp expiry is a direct _inlineStatBoostSwitchOut call in
     // _handleSwitch. Callers (moves, abilities, shared effects) invoke these directly during
     // execute, so the boost-source key is still derived from msg.sender exactly as it was when
@@ -2356,7 +2355,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return;
         }
         _setBoostCountOf(config, targetIndex, monIndex, 0);
-        config.statBoostAcc[(targetIndex << 3) | monIndex] = 0; // also clears a DISABLED flag
 
         // Telescope back to base stats.
         uint32[5] memory baseStats = _getStatBoostBaseStats(config, targetIndex, monIndex);
@@ -2451,28 +2449,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             _setBoostCountOf(config, targetIndex, monIndex, count + 1);
         }
 
-        // Accumulator update: O(changed lanes), replacing the legacy all-source rescan. A merge
-        // divides the old word out and multiplies the merged word in (always correct, order-free).
-        // count-before == 0 initializes — stale recycled-key accumulators are never read.
-        uint256 lane = (targetIndex << 3) | monIndex;
-        uint256 acc = count == 0 ? 0 : config.statBoostAcc[lane];
-        if (acc & StatBoostLib.ACC_DISABLED_BIT == 0) {
-            bool ok = true;
-            if (found) {
-                (acc, ok) = StatBoostLib.applyWordToAcc(acc, oldWord, baseStats, false);
-            }
-            if (ok) {
-                (acc, ok) = StatBoostLib.applyWordToAcc(acc, newWord, baseStats, true);
-            }
-            if (!ok) {
-                acc = StatBoostLib.ACC_DISABLED_BIT; // overflow: recompute-from-sources from here on
-            }
-            config.statBoostAcc[lane] = acc;
-        } else {
-            acc = StatBoostLib.ACC_DISABLED_BIT;
-        }
-
-        _applyStatBoostAggregates(config, targetIndex, monIndex, baseStats, acc);
+        _applyStatBoostAggregates(config, targetIndex, monIndex, baseStats);
     }
 
     function _removeStatBoostWithKey(uint256 targetIndex, uint256 monIndex, uint168 key, bool isPerm) private {
@@ -2494,37 +2471,35 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             }
             _setBoostCountOf(config, targetIndex, monIndex, last);
 
-            uint32[5] memory baseStats = _getStatBoostBaseStats(config, targetIndex, monIndex);
-            uint256 lane = (targetIndex << 3) | monIndex;
-            uint256 acc = config.statBoostAcc[lane];
-            if (acc & StatBoostLib.ACC_DISABLED_BIT == 0) {
-                bool ok;
-                (acc, ok) = StatBoostLib.applyWordToAcc(acc, w, baseStats, false);
-                if (!ok) {
-                    acc = StatBoostLib.ACC_DISABLED_BIT;
-                }
-                config.statBoostAcc[lane] = acc;
-            }
-            _applyStatBoostAggregates(config, targetIndex, monIndex, baseStats, acc);
+            _applyStatBoostAggregates(
+                config, targetIndex, monIndex, _getStatBoostBaseStats(config, targetIndex, monIndex)
+            );
             return;
         }
     }
 
-    /// @dev Telescope from either the fast-path accumulator or (when DISABLED) a full
-    ///      recompute over the mon's source words — the recompute IS the legacy aggregation,
-    ///      so overflow behavior degrades to exactly the old math.
+    /// @dev Recompute the mon's aggregate from its source words (the add/remove scans have
+    ///      already warmed them) and telescope the deltas. The packed accumulator is the exact
+    ///      fast form of the legacy aggregation; on lane overflow the legacy unchecked math is
+    ///      the fallback, so both branches agree with the old accumulator-cache results.
     function _applyStatBoostAggregates(
         BattleConfig storage config,
         uint256 targetIndex,
         uint256 monIndex,
-        uint32[5] memory baseStats,
-        uint256 acc
+        uint32[5] memory baseStats
     ) private {
+        mapping(uint256 => bytes32) storage words = _boostWordsOf(config, targetIndex);
+        uint256 count = _boostCountOf(config, targetIndex, monIndex);
+        uint256 baseSlot = monIndex * 16;
+        uint256 acc;
+        bool ok = true;
+        for (uint256 i; i < count && ok; ++i) {
+            (acc, ok) = StatBoostLib.applyWordToAcc(acc, words[baseSlot + i], baseStats, true);
+        }
         uint32[5] memory newBoostedStats;
-        if (acc & StatBoostLib.ACC_DISABLED_BIT != 0) {
-            mapping(uint256 => bytes32) storage words = _boostWordsOf(config, targetIndex);
-            uint256 count = _boostCountOf(config, targetIndex, monIndex);
-            uint256 baseSlot = monIndex * 16;
+        if (ok) {
+            newBoostedStats = StatBoostLib.finalizeAccStats(acc, baseStats);
+        } else {
             uint32[5] memory numBoostsPerStat;
             uint256[5] memory accumulatedNumeratorPerStat;
             for (uint256 i; i < count; ++i) {
@@ -2534,8 +2509,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             }
             newBoostedStats =
                 StatBoostLib.finalizeBoostedStats(baseStats, numBoostsPerStat, accumulatedNumeratorPerStat);
-        } else {
-            newBoostedStats = StatBoostLib.finalizeAccStats(acc, baseStats);
         }
         _applyBoostedStats(config, targetIndex, monIndex, baseStats, newBoostedStats);
     }
@@ -2633,11 +2606,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         mapping(uint256 => bytes32) storage words = _boostWordsOf(config, targetIndex);
         uint256 count = _boostCountOf(config, targetIndex, monIndex);
         uint256 baseSlot = monIndex * 16;
-        uint32[5] memory baseStats = _getStatBoostBaseStats(config, targetIndex, monIndex);
-
-        uint256 lane = (targetIndex << 3) | monIndex;
-        uint256 acc = config.statBoostAcc[lane];
-        bool live = acc & StatBoostLib.ACC_DISABLED_BIT == 0;
         uint256 kept = count;
         uint256 i;
         while (i < kept) {
@@ -2645,14 +2613,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             if (StatBoostLib.isPerm(w)) {
                 ++i;
                 continue;
-            }
-            if (live) {
-                bool ok;
-                (acc, ok) = StatBoostLib.applyWordToAcc(acc, w, baseStats, false);
-                if (!ok) {
-                    acc = StatBoostLib.ACC_DISABLED_BIT;
-                    live = false;
-                }
             }
             --kept;
             if (i != kept) {
@@ -2663,8 +2623,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return; // nothing expired: no writes, no telescope
         }
         _setBoostCountOf(config, targetIndex, monIndex, kept);
-        config.statBoostAcc[lane] = acc;
-        _applyStatBoostAggregates(config, targetIndex, monIndex, baseStats, acc);
+        _applyStatBoostAggregates(config, targetIndex, monIndex, _getStatBoostBaseStats(config, targetIndex, monIndex));
     }
 
     function setGlobalKV(uint64 key, uint192 value) external {
@@ -2913,22 +2872,14 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint256 rng
     ) private {
         IMoveResolver resolver = IMoveResolver(address(uint160(rawMoveSlot)));
-        (uint256 command, uint32 continuation) = resolver.resolveMove(
-            0, 0, attackerPlayerIndex, attackerMonIndex, targetBits, activesPacked, extraData, rng
-        );
+        (uint256 command, uint32 continuation) =
+            resolver.resolveMove(0, 0, attackerPlayerIndex, attackerMonIndex, targetBits, activesPacked, extraData, rng);
         int32 result = _executeResolvedMoveCommand(
             config, battle, rawMoveSlot, attackerPlayerIndex, attackerMonIndex, targetBits, command, rng
         );
         if (continuation != 0) {
             (command,) = resolver.resolveMove(
-                continuation,
-                result,
-                attackerPlayerIndex,
-                attackerMonIndex,
-                targetBits,
-                activesPacked,
-                extraData,
-                rng
+                continuation, result, attackerPlayerIndex, attackerMonIndex, targetBits, activesPacked, extraData, rng
             );
             _executeResolvedMoveCommand(
                 config, battle, rawMoveSlot, attackerPlayerIndex, attackerMonIndex, targetBits, command, rng
@@ -3833,9 +3784,8 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint256 activesPacked
     ) private returns (bytes32 updatedExtraData, bool removeAfterRun) {
         uint256 command;
-        (updatedExtraData, removeAfterRun, command) = IEffectResolver(address(effect)).resolveEffect(
-            round, rng, data, playerIndex, monIndex, _freshHookContext(round, activesPacked)
-        );
+        (updatedExtraData, removeAfterRun, command) = IEffectResolver(address(effect))
+            .resolveEffect(round, rng, data, playerIndex, monIndex, _freshHookContext(round, activesPacked));
         _applyEffectCommand(command);
     }
 
@@ -3996,7 +3946,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         if (effectIndex == 2) {
             effectsCount = config.globalEffectsLength;
         } else {
-
             // The battle-wide union is only the cheap outer gate. This exact mon lane prevents
             // one listener (including a benched mon's) from routing unrelated active lists.
             if (!_monListensAt(config, effectIndex, monIndex, round)) {
@@ -4901,16 +4850,17 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                         actionRng
                     );
                 } else {
-                    IMoveSet(address(uint160(rawMoveSlot))).move(
-                        IEngine(address(this)),
-                        battleKey,
-                        side,
-                        activeMon,
-                        targetBits,
-                        moveContext,
-                        uint16(moveExtra & EXTRA_DATA_PAYLOAD_MASK),
-                        actionRng
-                    );
+                    IMoveSet(address(uint160(rawMoveSlot)))
+                        .move(
+                            IEngine(address(this)),
+                            battleKey,
+                            side,
+                            activeMon,
+                            targetBits,
+                            moveContext,
+                            uint16(moveExtra & EXTRA_DATA_PAYLOAD_MASK),
+                            actionRng
+                        );
                 }
             }
         }
@@ -5271,8 +5221,8 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
 
         // Move words are [packedMoveIndex 8 | extraData 16], so shifting the whole word lands
         // both fields in their MonMoves lanes.
-        uint256 packedMoves = uint256(uint8(p0MonIndex)) | (p0Move << 8) | (uint256(uint8(p1MonIndex)) << 32)
-            | (p1Move << 40);
+        uint256 packedMoves =
+            uint256(uint8(p0MonIndex)) | (p0Move << 8) | (uint256(uint8(p1MonIndex)) << 32) | (p1Move << 40);
 
         uint256 packedSalts = uint256(p0Salt) | (uint256(p1Salt) << 104);
 

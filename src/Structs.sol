@@ -218,11 +218,6 @@ struct BattleConfig {
     // No reset needed on recycled keys: words are only read below the (reset) count.
     mapping(uint256 => bytes32) p0BoostWords;
     mapping(uint256 => bytes32) p1BoostWords;
-    // Per-mon aggregation cache, laneIndex = side*8 + monIndex: 5 stat lanes of
-    // [numerator:48 | count:3] (bits k*51..) + bit 255 = disabled (overflow fallback).
-    // Never read when the mon's source count is 0 (initialize-on-first-add), so recycled-key
-    // staleness is unobservable; count > 0 implies this battle wrote it.
-    mapping(uint256 => uint256) statBoostAcc;
     // Exact OR of live EffectInstance.stepsBitmap values for each player mon.
     // Lane index = side*8 + monIndex; one uint16 lane per mon fills one word exactly.
     // Appended after mappings so existing BattleConfig mapping roots remain stable.

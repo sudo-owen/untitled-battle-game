@@ -28,6 +28,7 @@ abstract contract GasMeasure is CommonBase {
     uint256 private constant CONFIG_P1_STATES_OFFSET = 10;
     uint256 private constant CONFIG_P0_EFFECTS_OFFSET = 12;
     uint256 private constant CONFIG_P1_EFFECTS_OFFSET = 13;
+    uint256 private constant CONFIG_STEPS_BY_MON_OFFSET = 17;
 
     struct Tally {
         uint256 totalSload;
@@ -354,8 +355,7 @@ abstract contract GasMeasure is CommonBase {
         t.uniqueWrittenLanes = _popcount16(t.writtenLanes);
         t.currentStorageOps = t.reads + t.writes;
         t.frameStorageOps = t.uniqueTouchedLanes + t.uniqueWrittenLanes;
-        t.removableStorageOps =
-            t.currentStorageOps > t.frameStorageOps ? t.currentStorageOps - t.frameStorageOps : 0;
+        t.removableStorageOps = t.currentStorageOps > t.frameStorageOps ? t.currentStorageOps - t.frameStorageOps : 0;
     }
 
     /// @notice Count one account's exact storage working set in the recorded transaction.
@@ -435,15 +435,24 @@ abstract contract GasMeasure is CommonBase {
                 if (a.account == engine) {
                     bool callbackFrame = frame.accessor != rootCaller && frame.accessor != engine;
                     if (callbackFrame) {
-                        if (a.isWrite) t.engineCallbackWrites++;
-                        else t.engineCallbackReads++;
+                        if (a.isWrite) {
+                            t.engineCallbackWrites++;
+                        } else {
+                            t.engineCallbackReads++;
+                        }
                     } else {
-                        if (a.isWrite) t.engineRootWrites++;
-                        else t.engineRootReads++;
+                        if (a.isWrite) {
+                            t.engineRootWrites++;
+                        } else {
+                            t.engineRootReads++;
+                        }
                     }
                 } else if (uint160(a.account) > 0xff) {
-                    if (a.isWrite) t.externalWrites++;
-                    else t.externalReads++;
+                    if (a.isWrite) {
+                        t.externalWrites++;
+                    } else {
+                        t.externalReads++;
+                    }
                 }
             }
         }
@@ -464,20 +473,14 @@ abstract contract GasMeasure is CommonBase {
         bool[] memory writtenSeen = new bool[](cap);
 
         _insertStorageCategory(slots, categories, occupied, bytes32(uint256(1)), STORAGE_SHELL);
-        _insertStorageCategory(
-            slots, categories, occupied, keccak256(abi.encode(battleKey, uint256(2))), STORAGE_SHELL
-        );
+        _insertStorageCategory(slots, categories, occupied, keccak256(abi.encode(battleKey, uint256(2))), STORAGE_SHELL);
         for (uint256 i; i < 16; i++) {
-            _insertStorageCategory(
-                slots, categories, occupied, keccak256(abi.encode(i, uint256(0))), STORAGE_SHELL
-            );
+            _insertStorageCategory(slots, categories, occupied, keccak256(abi.encode(i, uint256(0))), STORAGE_SHELL);
         }
 
         bytes32 battleBase = keccak256(abi.encode(battleKey, uint256(5)));
         _insertStorageCategory(slots, categories, occupied, battleBase, STORAGE_BATTLE_DATA);
-        _insertStorageCategory(
-            slots, categories, occupied, bytes32(uint256(battleBase) + 1), STORAGE_BATTLE_DATA
-        );
+        _insertStorageCategory(slots, categories, occupied, bytes32(uint256(battleBase) + 1), STORAGE_BATTLE_DATA);
         bytes32 multiBase = keccak256(abi.encode(battleKey, uint256(6)));
         _insertStorageCategory(slots, categories, occupied, multiBase, STORAGE_BATTLE_DATA);
         _insertStorageCategory(slots, categories, occupied, bytes32(uint256(multiBase) + 1), STORAGE_BATTLE_DATA);
@@ -485,19 +488,17 @@ abstract contract GasMeasure is CommonBase {
         bytes32 configBase = keccak256(abi.encode(storageKey, ENGINE_BATTLE_CONFIG_ROOT));
         for (uint256 offset; offset <= 5; offset++) {
             _insertStorageCategory(
-                slots,
-                categories,
-                occupied,
-                bytes32(uint256(configBase) + offset),
-                STORAGE_CONFIG_HEADER
+                slots, categories, occupied, bytes32(uint256(configBase) + offset), STORAGE_CONFIG_HEADER
             );
         }
         _insertStorageCategory(
-            slots, categories, occupied, bytes32(uint256(configBase) + 18), STORAGE_CONFIG_HEADER
+            slots,
+            categories,
+            occupied,
+            bytes32(uint256(configBase) + CONFIG_STEPS_BY_MON_OFFSET),
+            STORAGE_CONFIG_HEADER
         );
-        _insertStorageCategory(
-            slots, categories, occupied, bytes32(uint256(configBase) + 6), STORAGE_STATIC_CATALOG
-        );
+        _insertStorageCategory(slots, categories, occupied, bytes32(uint256(configBase) + 6), STORAGE_STATIC_CATALOG);
 
         _insertTeamAndStateCategories(slots, categories, occupied, configBase);
         _insertEffectCategories(slots, categories, occupied, configBase);
@@ -525,8 +526,11 @@ abstract contract GasMeasure is CommonBase {
                 if (category == STORAGE_OTHER && t.firstOtherSlot == bytes32(0)) {
                     t.firstOtherSlot = a.slot;
                 }
-                if (a.isWrite) t.writes[category]++;
-                else t.reads[category]++;
+                if (a.isWrite) {
+                    t.writes[category]++;
+                } else {
+                    t.reads[category]++;
+                }
                 if (!seen[idx]) {
                     seen[idx] = true;
                     t.uniqueTouched[category]++;
@@ -554,18 +558,10 @@ abstract contract GasMeasure is CommonBase {
             bytes32 p1Mon = keccak256(abi.encode(mon, p1TeamRoot));
             for (uint256 word; word < 6; word++) {
                 _insertStorageCategory(
-                    slots,
-                    categories,
-                    occupied,
-                    bytes32(uint256(p0Mon) + word),
-                    STORAGE_STATIC_CATALOG
+                    slots, categories, occupied, bytes32(uint256(p0Mon) + word), STORAGE_STATIC_CATALOG
                 );
                 _insertStorageCategory(
-                    slots,
-                    categories,
-                    occupied,
-                    bytes32(uint256(p1Mon) + word),
-                    STORAGE_STATIC_CATALOG
+                    slots, categories, occupied, bytes32(uint256(p1Mon) + word), STORAGE_STATIC_CATALOG
                 );
             }
             _insertStorageCategory(
@@ -589,28 +585,20 @@ abstract contract GasMeasure is CommonBase {
         for (uint256 i; i < 256; i++) {
             bytes32 header = keccak256(abi.encode(i, globalRoot));
             _insertStorageCategory(slots, categories, occupied, header, STORAGE_EFFECTS);
-            _insertStorageCategory(
-                slots, categories, occupied, bytes32(uint256(header) + 1), STORAGE_EFFECTS
-            );
+            _insertStorageCategory(slots, categories, occupied, bytes32(uint256(header) + 1), STORAGE_EFFECTS);
         }
         uint256 playerSlots = 8 * EFFECT_SLOTS_PER_MON;
         for (uint256 i; i < playerSlots; i++) {
             bytes32 p0Header = keccak256(abi.encode(i, p0Root));
             bytes32 p1Header = keccak256(abi.encode(i, p1Root));
             _insertStorageCategory(slots, categories, occupied, p0Header, STORAGE_EFFECTS);
-            _insertStorageCategory(
-                slots, categories, occupied, bytes32(uint256(p0Header) + 1), STORAGE_EFFECTS
-            );
+            _insertStorageCategory(slots, categories, occupied, bytes32(uint256(p0Header) + 1), STORAGE_EFFECTS);
             _insertStorageCategory(slots, categories, occupied, p1Header, STORAGE_EFFECTS);
-            _insertStorageCategory(
-                slots, categories, occupied, bytes32(uint256(p1Header) + 1), STORAGE_EFFECTS
-            );
+            _insertStorageCategory(slots, categories, occupied, bytes32(uint256(p1Header) + 1), STORAGE_EFFECTS);
         }
         bytes32 hookRoot = bytes32(uint256(configBase) + 14);
         for (uint256 i; i < 256; i++) {
-            _insertStorageCategory(
-                slots, categories, occupied, keccak256(abi.encode(i, hookRoot)), STORAGE_EFFECTS
-            );
+            _insertStorageCategory(slots, categories, occupied, keccak256(abi.encode(i, hookRoot)), STORAGE_EFFECTS);
         }
     }
 
@@ -622,19 +610,9 @@ abstract contract GasMeasure is CommonBase {
     ) private pure {
         bytes32 p0Root = bytes32(uint256(configBase) + 15);
         bytes32 p1Root = bytes32(uint256(configBase) + 16);
-        bytes32 accRoot = bytes32(uint256(configBase) + 17);
         for (uint256 i; i < 8 * 16; i++) {
-            _insertStorageCategory(
-                slots, categories, occupied, keccak256(abi.encode(i, p0Root)), STORAGE_BOOSTS
-            );
-            _insertStorageCategory(
-                slots, categories, occupied, keccak256(abi.encode(i, p1Root)), STORAGE_BOOSTS
-            );
-        }
-        for (uint256 lane; lane < 16; lane++) {
-            _insertStorageCategory(
-                slots, categories, occupied, keccak256(abi.encode(lane, accRoot)), STORAGE_BOOSTS
-            );
+            _insertStorageCategory(slots, categories, occupied, keccak256(abi.encode(i, p0Root)), STORAGE_BOOSTS);
+            _insertStorageCategory(slots, categories, occupied, keccak256(abi.encode(i, p1Root)), STORAGE_BOOSTS);
         }
     }
 
@@ -667,20 +645,20 @@ abstract contract GasMeasure is CommonBase {
                 rawKey := mload(add(data, 68))
             }
             _insertStorageCategory(
-                slots,
-                categories,
-                occupied,
-                keccak256(abi.encode(uint64(rawKey), valuesRoot)),
-                STORAGE_GLOBAL_KV
+                slots, categories, occupied, keccak256(abi.encode(uint64(rawKey), valuesRoot)), STORAGE_GLOBAL_KV
             );
         }
         for (uint256 i; i < accesses.length; i++) {
             Vm.StorageAccess[] memory sa = accesses[i].storageAccesses;
             for (uint256 j; j < sa.length; j++) {
                 Vm.StorageAccess memory a = sa[j];
-                if (a.account != engine || a.reverted) continue;
+                if (a.account != engine || a.reverted) {
+                    continue;
+                }
                 for (uint256 k; k < keySlots.length; k++) {
-                    if (a.slot != keySlots[k]) continue;
+                    if (a.slot != keySlots[k]) {
+                        continue;
+                    }
                     _insertPackedGlobalKeys(slots, categories, occupied, valuesRoot, uint256(a.previousValue));
                     _insertPackedGlobalKeys(slots, categories, occupied, valuesRoot, uint256(a.newValue));
                     break;
@@ -789,8 +767,7 @@ abstract contract GasMeasure is CommonBase {
             m.commits += _popcount16(dirty);
         }
         m.modeledStorageOps = m.loads + m.commits;
-        m.removableStorageOps =
-            currentStorageOps > m.modeledStorageOps ? currentStorageOps - m.modeledStorageOps : 0;
+        m.removableStorageOps = currentStorageOps > m.modeledStorageOps ? currentStorageOps - m.modeledStorageOps : 0;
     }
 
     /// @notice Model a lazy memory frame for the two BattleData words and seven direct
@@ -814,7 +791,7 @@ abstract contract GasMeasure is CommonBase {
         for (uint256 offset; offset <= 5; offset++) {
             headerSlots[2 + offset] = bytes32(uint256(configBase) + offset);
         }
-        headerSlots[8] = bytes32(uint256(configBase) + 18);
+        headerSlots[8] = bytes32(uint256(configBase) + CONFIG_STEPS_BY_MON_OFFSET);
 
         uint16 loaded;
         uint16 dirty;
@@ -836,9 +813,13 @@ abstract contract GasMeasure is CommonBase {
             Vm.StorageAccess[] memory sa = frame.storageAccesses;
             for (uint256 j; j < sa.length; j++) {
                 Vm.StorageAccess memory a = sa[j];
-                if (a.account != engine || a.reverted) continue;
+                if (a.account != engine || a.reverted) {
+                    continue;
+                }
                 for (uint256 word; word < headerSlots.length; word++) {
-                    if (a.slot != headerSlots[word]) continue;
+                    if (a.slot != headerSlots[word]) {
+                        continue;
+                    }
                     m.currentStorageOps++;
                     if (callbackFrame) {
                         m.callbackPassthroughOps++;
@@ -847,20 +828,25 @@ abstract contract GasMeasure is CommonBase {
                     uint16 wordBit = uint16(1 << word);
                     if (loaded & wordBit == 0) {
                         m.loads++;
-                        if (everLoaded & wordBit != 0) m.reloadedWords++;
+                        if (everLoaded & wordBit != 0) {
+                            m.reloadedWords++;
+                        }
                         loaded |= wordBit;
                         everLoaded |= wordBit;
                     }
-                    if (a.isWrite) dirty |= wordBit;
+                    if (a.isWrite) {
+                        dirty |= wordBit;
+                    }
                     break;
                 }
             }
         }
-        if (dirty != 0) m.commits += _popcount16(dirty);
+        if (dirty != 0) {
+            m.commits += _popcount16(dirty);
+        }
         m.modeledStorageOps = m.loads + m.commits + m.callbackPassthroughOps;
-        m.removableStorageOps = m.currentStorageOps > m.modeledStorageOps
-            ? m.currentStorageOps - m.modeledStorageOps
-            : 0;
+        m.removableStorageOps =
+            m.currentStorageOps > m.modeledStorageOps ? m.currentStorageOps - m.modeledStorageOps : 0;
     }
 
     function _isLegacyBoundary(Vm.AccountAccess memory a, address engine, bytes4[] memory selectors)

@@ -382,8 +382,8 @@ round-trips.)
 
 How it works:
 - Each boost **source** is one packed word in a dedicated per-mon boost store
-  (`p0BoostWords`/`p1BoostWords`; 4-bit counts in `p0/p1BoostCounts`, aggregation cache in
-  `statBoostAcc`) — NOT an effect-list entry, so effect passes never iterate boost sources.
+  (`p0BoostWords`/`p1BoostWords`; 4-bit counts in `p0/p1BoostCounts`; the aggregate is recomputed
+  from the words on every change) — NOT an effect-list entry, so effect passes never iterate boost sources.
   Sources are keyed by `msg.sender`, so each move/ability/effect
   stacks independently and can remove its own boost. Boosts are **multiplicative** per source; `Temp`
   boosts are dropped on switch-out by a direct `_inlineStatBoostSwitchOut` call in `_handleSwitch`,
