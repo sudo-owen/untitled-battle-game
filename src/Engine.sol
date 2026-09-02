@@ -1319,7 +1319,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // provably nothing to run. Ordering (global, priority, other) is preserved.
             if (config.globalEffectsLength != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1332,7 +1331,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             }
             if ((config.playerEffectStepsUnion & uint16(1 << uint8(EffectStep.RoundStart))) != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1343,7 +1341,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                     playerSwitchForTurnFlag
                 );
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1365,7 +1362,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // effect that listens at AfterMove.
             if ((config.playerEffectStepsUnion & uint16(1 << uint8(EffectStep.AfterMove))) != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1380,7 +1376,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // Always run the global effect's afterMove hook(s)
             if (config.globalEffectsLength != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1435,7 +1430,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // Union re-read: the non-priority move just executed may have added an AfterMove listener.
             if ((config.playerEffectStepsUnion & uint16(1 << uint8(EffectStep.AfterMove))) != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1450,7 +1444,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // Always run the global effect's afterMove hook(s)
             if (config.globalEffectsLength != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1479,7 +1472,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             // since the two moves this turn may have applied a RoundEnd status). Ordering preserved.
             if (config.globalEffectsLength != 0) {
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1494,7 +1486,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             if ((config.playerEffectStepsUnion & uint16(1 << uint8(EffectStep.RoundEnd))) != 0) {
                 // If priority mon is not KOed, run roundEnd effects for the priority mon
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -1507,7 +1498,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
 
                 // If non priority mon is not KOed, run roundEnd effects for the non priority mon
                 playerSwitchForTurnFlag = _handleEffects(
-                    battleKey,
                     config,
                     battle,
                     rng,
@@ -3969,7 +3959,6 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     }
 
     function _handleEffects(
-        bytes32 battleKey,
         BattleConfig storage config,
         BattleData storage battle,
         uint256 rng,
@@ -3985,14 +3974,13 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return playerSwitchForTurnFlag;
         }
 
-        // Short-circuit if no effects exist for this target (skip both effects and KO check).
-        // The count we resolve here is for the active mon (or the global list), which is exactly
-        // the list _runEffects iterates — so we thread it in to skip _runEffects' own initial read.
+        // One active-lane read feeds the mon index, the listener/KO gates and the hook context.
+        uint256 activeWord = battle.activeMonIndex;
+        uint256 monIndex = playerIndex == 2 ? 0 : _unpackActiveMonIndex(uint16(activeWord), playerIndex);
         uint256 effectsCount;
         if (effectIndex == 2) {
             effectsCount = config.globalEffectsLength;
         } else {
-            uint256 monIndex = _unpackActiveMonIndex(battle.activeMonIndex, playerIndex);
 
             // The battle-wide union is only the cheap outer gate. This exact mon lane prevents
             // one listener (including a benched mon's) from routing unrelated active lists.
@@ -4014,8 +4002,17 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         }
 
         if (effectsCount > 0) {
-            // Run the effects (thread the resolved count so _runEffects skips its own initial read)
-            _runEffects(battleKey, rng, effectIndex, playerIndex, round, "", effectsCount);
+            _runEffectsCore(
+                config,
+                rng,
+                effectIndex,
+                playerIndex,
+                monIndex,
+                round,
+                "",
+                effectsCount,
+                TargetLib.singlesActives(uint8(activeWord), uint8(activeWord >> 8))
+            );
         }
 
         // Only check for Game Over / KO if a KO actually occurred since last check
