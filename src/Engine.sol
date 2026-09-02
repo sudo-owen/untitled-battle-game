@@ -1549,16 +1549,9 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return winner;
         }
 
-        // End of turn cleanup:
-        // - Progress turn index
-        // - Set the player switch for turn flag on battle data
-        // - Update lastExecuteTimestamp for timeout tracking
-        // - Clear move flags for next turn (clear isRealTurn bit by setting packedMoveIndex to 0)
-        // The three BattleData fields share slot 1 and are written adjacently (no storage
-        // barrier between) so the optimizer coalesces them into one SSTORE.
-        battle.turnId += 1;
-        battle.playerSwitchForTurnFlag = uint8(playerSwitchForTurnFlag);
-        battle.lastExecuteTimestamp = uint40(block.timestamp);
+        // End of turn cleanup: advance the turn, store the switch flag and timestamp, and clear
+        // the storage move flags for next turn (clear isRealTurn bit by zeroing packedMoveIndex).
+        _advanceTurn(battle, playerSwitchForTurnFlag);
         // Clear storage move slots only when they were actually written via setMove (execute() path).
         // executeWithMoves never writes, so the slots stay zero and a clear here would burn ~4.4k on
         // a cold-access SSTORE 0→0.
@@ -4353,9 +4346,26 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return winner;
         }
 
-        battle.turnId += 1;
-        battle.playerSwitchForTurnFlag = uint8(newFlag);
-        battle.lastExecuteTimestamp = uint40(block.timestamp);
+        _advanceTurn(battle, newFlag);
+    }
+
+    /// @dev End-of-turn BattleData update as ONE read-modify-write of slot 1. turnId,
+    ///      playerSwitchForTurnFlag and lastExecuteTimestamp share the word, but via-IR emits a
+    ///      separate SLOAD+SSTORE per field (measured), so the lanes are masked by hand here.
+    ///      Layout: p0 [0..160) | winnerIndex [160..168) | playerSwitchForTurnFlag [168..176) |
+    ///      activeMonIndex [176..192) | lastExecuteTimestamp [192..232) | turnId [232..248) |
+    ///      numBuffered [248..256). Keep in sync with `forge inspect Engine storage-layout`.
+    function _advanceTurn(BattleData storage battle, uint256 newFlag) private {
+        uint256 word;
+        assembly ("memory-safe") {
+            word := sload(add(battle.slot, 1))
+        }
+        uint16 nextTurn = uint16(word >> 232) + 1; // checked, mirrors `turnId += 1`
+        word = (word & ~((uint256(0xFF) << 168) | (uint256(0xFFFFFFFFFF) << 192) | (uint256(0xFFFF) << 232)))
+            | (newFlag << 168) | (uint256(uint40(block.timestamp)) << 192) | (uint256(nextTurn) << 232);
+        assembly ("memory-safe") {
+            sstore(add(battle.slot, 1), word)
+        }
     }
 
     function _runSlotTurn(bytes32 battleKey, BattleConfig storage config, BattleData storage battle)
