@@ -1173,13 +1173,14 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         BattleData storage battle = battleData[battleKey];
         BattleConfig storage config = battleConfig[storageKey];
 
-        // Check for game over
-        if (battle.winnerIndex != 2) {
+        // Check for game over (winnerIndex and turnId share slot 1: one read)
+        uint256 battleWord = _battleWord(battle);
+        if (uint8(battleWord >> 160) != 2) {
             revert GameAlreadyOver();
         }
 
         // Set up turn / player vars
-        uint256 turnId = battle.turnId;
+        uint256 turnId = uint16(battleWord >> 232);
         uint256 playerSwitchForTurnFlag = 2;
         uint256 priorityPlayerIndex;
 
@@ -3453,13 +3454,19 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint8 storedMoveIndex = uint8(moveWord) & MOVE_INDEX_MASK;
         uint8 moveIndex = storedMoveIndex >= SWITCH_MOVE_INDEX ? storedMoveIndex : storedMoveIndex - MOVE_INDEX_OFFSET;
 
+        // One slot-1 read serves every BattleData field below: nothing between here and the
+        // move/switch dispatch can mutate the word (the stamina() probe is a staticcall).
+        uint256 battleWord = _battleWord(battle);
+        uint16 activesWord = uint16(battleWord >> 176);
+        uint256 turnId = uint16(battleWord >> 232);
+
         // Handle shouldSkipTurn flag first and toggle it off if set
-        uint256 activeMonIndex = _unpackActiveMonIndex(battle.activeMonIndex, playerIndex);
+        uint256 activeMonIndex = _unpackActiveMonIndex(activesWord, playerIndex);
         MonState storage currentMonState = _getMonState(config, playerIndex, activeMonIndex);
         if (currentMonState.shouldSkipTurn) {
             currentMonState.shouldSkipTurn = false;
             // A forced-switch turn's coerced send-in is not an action the skip flag may eat.
-            uint8 storedFlag = battle.playerSwitchForTurnFlag;
+            uint8 storedFlag = uint8(battleWord >> 168);
             if (storedFlag != 0 && storedFlag != 1) {
                 return playerSwitchForTurnFlag;
             }
@@ -3473,7 +3480,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
 
         // Coerce to a switch when one is required: turn 0 (initial send-in) or active mon KO'd.
         // Target the first non-KO'd slot so the switch always lands
-        if ((battle.turnId == 0 || currentMonState.isKnockedOut) && moveIndex != SWITCH_MOVE_INDEX) {
+        if ((turnId == 0 || currentMonState.isKnockedOut) && moveIndex != SWITCH_MOVE_INDEX) {
             moveIndex = SWITCH_MOVE_INDEX;
             extraData = uint16(_firstNonKOed(config, playerIndex));
         }
@@ -3493,7 +3500,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                 return playerSwitchForTurnFlag;
             }
             // Disallow switching to the same mon except on turn 0 (initial send-in allows both players to pick mon 0).
-            if (battle.turnId != 0 && monToSwitchIndex == activeMonIndex) {
+            if (turnId != 0 && monToSwitchIndex == activeMonIndex) {
                 return playerSwitchForTurnFlag;
             }
             _handleSwitch(battleKey, config, battle, playerIndex, monToSwitchIndex, activeMonIndex);
@@ -3532,7 +3539,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                 // Deduct stamina and execute (MonMoves already emitted upfront in execute())
                 _deductStamina(currentMonState, staminaCost);
 
-                uint256 defenderMonIndex = _unpackActiveMonIndex(battle.activeMonIndex, 1 - playerIndex);
+                uint256 defenderMonIndex = _unpackActiveMonIndex(activesWord, 1 - playerIndex);
                 _inlineStandardAttack(
                     config, rawMoveSlot, playerIndex, activeMonIndex, 1 - playerIndex, defenderMonIndex, tempRNG
                 );
@@ -3559,9 +3566,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
                     staminaCost = int32(moveStamina);
                 }
                 _deductStamina(currentMonState, staminaCost);
-                uint256 moveContext = TargetLib.singlesActives(
-                    _unpackActiveMonIndex(battle.activeMonIndex, 0), _unpackActiveMonIndex(battle.activeMonIndex, 1)
-                );
+                uint256 moveContext = TargetLib.singlesActives(uint8(activesWord), uint8(activesWord >> 8));
                 if (rawMoveSlot & MOVE_CONTEXT_STATUS_LANES != 0) {
                     moveContext |= uint256(config.monStatusLanes) << 132;
                 }
@@ -3928,12 +3933,13 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     ) private returns (uint256 playerSwitchForTurnFlag) {
         // Check for Game Over and return early if so
         playerSwitchForTurnFlag = prevPlayerSwitchForTurnFlag;
-        if (battle.winnerIndex != 2) {
+        uint256 battleWord = _battleWord(battle);
+        if (uint8(battleWord >> 160) != 2) {
             return playerSwitchForTurnFlag;
         }
 
-        // One active-lane read feeds the mon index, the listener/KO gates and the hook context.
-        uint256 activeWord = battle.activeMonIndex;
+        // The same slot-1 read feeds the mon index, the listener/KO gates and the hook context.
+        uint256 activeWord = uint16(battleWord >> 176);
         uint256 monIndex = playerIndex == 2 ? 0 : _unpackActiveMonIndex(uint16(activeWord), playerIndex);
         uint256 effectsCount;
         if (effectIndex == 2) {
@@ -4355,6 +4361,14 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
     ///      Layout: p0 [0..160) | winnerIndex [160..168) | playerSwitchForTurnFlag [168..176) |
     ///      activeMonIndex [176..192) | lastExecuteTimestamp [192..232) | turnId [232..248) |
     ///      numBuffered [248..256). Keep in sync with `forge inspect Engine storage-layout`.
+    /// @dev Raw BattleData slot-1 word (layout in _advanceTurn). Hot paths load it once per
+    ///      call-free window instead of one SLOAD per field.
+    function _battleWord(BattleData storage battle) private view returns (uint256 word) {
+        assembly ("memory-safe") {
+            word := sload(add(battle.slot, 1))
+        }
+    }
+
     function _advanceTurn(BattleData storage battle, uint256 newFlag) private {
         uint256 word;
         assembly ("memory-safe") {
