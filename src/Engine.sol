@@ -4556,9 +4556,10 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         view
         returns (uint256 locked)
     {
+        uint256 actives = _buildActivesWord(battle);
         for (uint256 s; s < 4;) {
             uint256 side = s >> 1;
-            uint256 mon = _slotActive(battle, s);
+            uint256 mon = TargetLib.activeAt(actives, s);
             uint256 prio;
             if (mon == EMPTY_ACTIVE_LANE) {
                 prio = SWITCH_PRIORITY;
@@ -4604,10 +4605,11 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             }
         }
         uint256 koBitmaps = config.koBitmaps;
+        uint256 actives = _buildActivesWord(battle);
         uint256 h = uint256(keccak256(abi.encode(rng, pick)));
         for (uint256 s; s < 4;) {
             if (actedMask & (1 << s) == 0) {
-                uint256 mon = _slotActive(battle, s);
+                uint256 mon = TargetLib.activeAt(actives, s);
                 bool candidate;
                 uint256 speed;
                 if (mon == EMPTY_ACTIVE_LANE) {
@@ -4667,10 +4669,11 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         uint256 candidateMask;
         uint256 listenerMask;
         uint256 speeds;
+        uint256 actives = _buildActivesWord(battle);
         for (uint256 s; s < 4;) {
             if (doneMask & (1 << s) == 0) {
                 uint256 side = s >> 1;
-                uint256 mon = _slotActive(battle, s);
+                uint256 mon = TargetLib.activeAt(actives, s);
                 if (mon != EMPTY_ACTIVE_LANE) {
                     MonState storage st = _getMonState(config, side, mon);
                     if (!st.isKnockedOut) {
@@ -4744,7 +4747,10 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             return; // lane not populated
         }
         uint8 moveIndex = stored >= SWITCH_MOVE_INDEX ? stored : stored - MOVE_INDEX_OFFSET;
-        uint256 activeMon = _slotActive(battle, absSlot);
+        // One actives read serves the actor and the target lookups below: nothing between them
+        // mutates the lanes (the stamina() probe is a staticcall).
+        uint256 actives = _buildActivesWord(battle);
+        uint256 activeMon = TargetLib.activeAt(actives, absSlot);
 
         if (activeMon == EMPTY_ACTIVE_LANE) {
             // Empty lane acts only as a turn-0 send-in.
@@ -4838,7 +4844,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             uint256 tMon = EMPTY_ACTIVE_LANE;
             if (targetBits != 0) {
                 tSlot = TargetLib.lowestSlot(targetBits);
-                tMon = _slotActive(battle, tSlot);
+                tMon = TargetLib.activeAt(actives, tSlot);
                 if (tMon == EMPTY_ACTIVE_LANE || _getMonState(config, tSlot >> 1, tMon).isKnockedOut) {
                     return;
                 }
@@ -4857,7 +4863,7 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
             if (isInlineAttack) {
                 _inlineStandardAttack(config, rawMoveSlot, side, activeMon, tSlot >> 1, tMon, actionRng);
             } else {
-                uint256 moveContext = _buildActivesWord(battle);
+                uint256 moveContext = actives;
                 if (rawMoveSlot & MOVE_CONTEXT_STATUS_LANES != 0) {
                     moveContext |= uint256(config.monStatusLanes) << 132;
                 }
@@ -5010,11 +5016,12 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         // One exact word answers both "has effects" and "listens at this step" for all actives.
         // Empty lanes (0xFF) naturally shift beyond the word and read false.
         uint256 stepsWord = config.playerEffectStepsByMon;
+        uint256 actives = _buildActivesWord(battle);
         if (
-            !_stepsWordListens(stepsWord, 0, _slotActive(battle, 0), step)
-                && !_stepsWordListens(stepsWord, 0, _slotActive(battle, 1), step)
-                && !_stepsWordListens(stepsWord, 1, _slotActive(battle, 2), step)
-                && !_stepsWordListens(stepsWord, 1, _slotActive(battle, 3), step)
+            !_stepsWordListens(stepsWord, 0, TargetLib.activeAt(actives, 0), step)
+                && !_stepsWordListens(stepsWord, 0, TargetLib.activeAt(actives, 1), step)
+                && !_stepsWordListens(stepsWord, 1, TargetLib.activeAt(actives, 2), step)
+                && !_stepsWordListens(stepsWord, 1, TargetLib.activeAt(actives, 3), step)
         ) {
             return;
         }
@@ -5076,8 +5083,9 @@ contract Engine is IEngine, MappingAllocator, EIP712 {
         returns (uint256)
     {
         uint256 mask;
+        uint256 actives = _buildActivesWord(battle);
         for (uint256 s; s < 4;) {
-            uint256 mon = _slotActive(battle, s);
+            uint256 mon = TargetLib.activeAt(actives, s);
             if (mon != EMPTY_ACTIVE_LANE && _getMonState(config, s >> 1, mon).isKnockedOut) {
                 (, bool found) = _firstLegalSwitchTarget(config, battle, s);
                 if (found) {
